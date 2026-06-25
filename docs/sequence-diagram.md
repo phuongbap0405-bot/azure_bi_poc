@@ -28,6 +28,21 @@ Responsibilities of each component:
 
 ADF knows which activities succeeded or failed, but it does not know which JSON page was written to ADLS or which cursor was committed to Gold. Therefore, `BatchLog` and `Checkpoint` are still required.
 
+### ADF Conditional Branching
+
+When routing Bronze → Silver → Gold, ADF must use the Bronze activity's `raw_row_count` as the single source of truth. Do not use `has_data` or `coalesce`.
+
+Use this exact If Condition expression for the Silver branch:
+
+```adf
+@greater(
+    int(activity('act_bronze_controlio').output.raw_row_count),
+    0
+)
+```
+
+If `raw_row_count` is missing from the Bronze activity output, the pipeline should fail clearly — do not treat it as zero.
+
 ---
 
 ## 2. Who Creates `batch_id`?

@@ -12,6 +12,8 @@
     "@azure/functions": "^4.0.0",
     "@azure/identity": "^4.13.1",
     "@azure/keyvault-secrets": "^4.11.2",
-    "@azure/storage-blob": "^12.32.0"
+    "@azure/storage-blob": "^12.32.0",
+    "parquetjs-lite": "^0.8.7",
+    "snappyjs": "^0.7.0"
   }
 }

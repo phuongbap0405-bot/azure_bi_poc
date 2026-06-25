@@ -349,6 +349,13 @@ class BronzeService {
                 completed_at_utc: new Date().toISOString(),
             };
 
+            // Ensure raw_row_count is present in Bronze manifest and include window/start date fields
+            manifestContent.raw_row_count = totalRows;
+            if (payload.windowStartUtcText) manifestContent.window_start_utc = payload.windowStartUtcText;
+            if (payload.windowEndUtcText) manifestContent.window_end_utc = payload.windowEndUtcText;
+            if (payload.startTime) manifestContent.start_date = payload.startTime;
+            if (payload.endTime) manifestContent.end_date = payload.endTime;
+
             await this.blobClient.writeJson(this.config.bronzeContainer, manifestPath, manifestContent);
 
             const bronzeFinishedAt = new Date();
@@ -388,6 +395,10 @@ class BronzeService {
                     bronze_path: bronzePath,
                     page_count: pageNumber,
                     raw_row_count: totalRows,
+                    window_start_utc: payload.windowStartUtcText,
+                    window_end_utc: payload.windowEndUtcText,
+                    start_date: payload.startTime,
+                    end_date: payload.endTime,
                     api_call_count: totalApiCalls,
                 },
             };

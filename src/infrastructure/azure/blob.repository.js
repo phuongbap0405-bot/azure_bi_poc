@@ -59,6 +59,17 @@ class BlobRepository {
             });
     }
 
+    async uploadBuffer(containerName, blobPath, buffer, contentType = "application/octet-stream") {
+        const containerClient = this.getContainerClient(containerName);
+        await containerClient
+            .getBlockBlobClient(blobPath)
+            .uploadData(buffer, {
+                blobHTTPHeaders: {
+                    blobContentType: contentType,
+                },
+            });
+    }
+
     async writeJson(containerName, blobPath, value) {
         const content = JSON.stringify(value, null, 2);
         await this.writeText(containerName, blobPath, content, "application/json");

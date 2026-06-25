@@ -1,5 +1,11 @@
 "use strict";
 
+const os = require("os");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const parquet = require("parquetjs-lite");
+
 const { AppError } = require("../../shared/errors/app-error");
 const { validateLogicalName } = require("../../shared/utils/validation");
 const { validateRequest } = require("./silver.validator");
@@ -9,6 +15,53 @@ const { Deduplicator } = require("./silver.deduplicator");
 const { EXCLUDED_FIELDS_FROM_CLEAN_OUTPUT } = require("./silver.constants");
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+// Timestamps stored as UTF8 ISO-8601 strings to avoid a parquetjs-lite BigInt
+// statistics bug with TIMESTAMP_MILLIS. All downstream tools (Spark, Synapse,
+// Power BI) can parse ISO-8601 strings without issue.
+const PARQUET_SCHEMA = new parquet.ParquetSchema({
+    unique_key: { type: "UTF8", compression: "SNAPPY" },
+    batch_id: { type: "UTF8", compression: "SNAPPY" },
+    source_page_number: { type: "INT32", optional: true, compression: "SNAPPY" },
+    source_name: { type: "UTF8", optional: true, compression: "SNAPPY" },
+    entity_name: { type: "UTF8", optional: true, compression: "SNAPPY" },
+    activity: { type: "BOOLEAN", optional: true, compression: "SNAPPY" },
+    activity_id: { type: "INT32", optional: true, compression: "SNAPPY" },
+    activity_type: { type: "INT32", optional: true, compression: "SNAPPY" },
+    activity_name: { type: "UTF8", optional: true, compression: "SNAPPY" },
+    caption: { type: "UTF8", optional: true, compression: "SNAPPY" },
+    user_id: { type: "INT32", optional: true, compression: "SNAPPY" },
+    computer_id: { type: "INT32", optional: true, compression: "SNAPPY" },
+    start_time_utc: { type: "UTF8", optional: true, compression: "SNAPPY" },
+    end_time_utc: { type: "UTF8", optional: true, compression: "SNAPPY" },
+    activity_date: { type: "UTF8", optional: true, compression: "SNAPPY" },
+    duration_seconds: { type: "DOUBLE", optional: true, compression: "SNAPPY" },
+    is_website: { type: "BOOLEAN", optional: true, compression: "SNAPPY" },
+    url_domain: { type: "UTF8", optional: true, compression: "SNAPPY" },
+    ingested_at_utc: { type: "UTF8", optional: true, compression: "SNAPPY" },
+});
+
+const TIMESTAMP_FIELDS = new Set(["start_time_utc", "end_time_utc", "ingested_at_utc"]);
+
+// Converts a normalized record into a Parquet-safe row:
+//   - null / undefined fields are omitted (optional columns → null in Parquet)
+//   - Date objects in timestamp fields are serialised as ISO-8601 strings
+//   - All other values are passed through unchanged
+const cleanParquetRecord = (record) => {
+    const cleaned = {};
+    for (const [key, value] of Object.entries(record)) {
+        if (value === null || value === undefined) {
+            continue; // omit → Parquet writes null for optional column
+        }
+        if (TIMESTAMP_FIELDS.has(key)) {
+            // Normalise to ISO-8601 string regardless of incoming type
+            cleaned[key] = value instanceof Date ? value.toISOString() : String(value);
+        } else {
+            cleaned[key] = value;
+        }
+    }
+    return cleaned;
+};
 
 class SilverService {
     constructor({ config, logger, batchLogRepository, blobRepository }) {
@@ -56,14 +109,7 @@ class SilverService {
             validateLogicalName(entityName, "entity_name");
 
             const pageCount = Number(bronzeManifest.page_count ?? 0);
-            if (!Number.isInteger(pageCount) || pageCount < 0) {
-                throw new AppError("Bronze manifest page_count is invalid", {
-                    errorCode: "INVALID_PAGE_COUNT",
-                    errorCategory: "DataQuality",
-                    httpStatus: 500,
-                });
-            }
-
+            const bronzeRawRowCount = Number(bronzeManifest.raw_row_count ?? 0);
             const startTime = String(bronzeManifest.start_time ?? "");
             const endTime = String(bronzeManifest.end_time ?? "");
             if (!DATE_PATTERN.test(startTime) || !DATE_PATTERN.test(endTime)) {
@@ -83,6 +129,87 @@ class SilverService {
                 entityName,
                 batchMonth
             );
+
+            // If Bronze produced no rows, mark Silver as Skipped and do not create empty parquet files.
+            if (bronzeRawRowCount === 0) {
+                const silverPrefix = buildSilverPrefix(sourceName, entityName, startTime, endTime, batchId);
+                const silverPath = `${this.config.silverContainer}/${silverPrefix}`;
+
+                const silverManifest = {
+                    batch_id: batchId,
+                    source_name: sourceName,
+                    entity_name: entityName,
+                    pipeline_type: pipelineType,
+                    start_time: startTime,
+                    end_time: endTime,
+                    bronze_path: `${this.config.bronzeContainer}/${bronzePrefix}`,
+                    silver_path: silverPath,
+                    source_page_count: pageCount,
+                    source_row_count: bronzeRawRowCount,
+                    clean_row_count: 0,
+                    rejected_row_count: 0,
+                    duplicate_row_count: 0,
+                    clean_file_count: 0,
+                    rejected_file_count: 0,
+                    output_format: "parquet",
+                    file_format: "parquet",
+                    compression: "snappy",
+                    schema_version: "1.0",
+                    output_files: [],
+                    excluded_from_clean_output: EXCLUDED_FIELDS_FROM_CLEAN_OUTPUT,
+                    status: "Skipped",
+                    skip_reason: "NO_BRONZE_RECORDS",
+                    completed_at_utc: new Date().toISOString(),
+                };
+
+                await this.blobClient.writeJson(
+                    this.config.silverContainer,
+                    `${silverPrefix}/manifest.json`,
+                    silverManifest
+                );
+
+                const silverFinishedAt = new Date();
+                await this.batchLogClient.upsertBatch({
+                    partitionKey: batchLogPartitionKey,
+                    rowKey: batchId,
+                    silver_path: silverPath,
+                    silver_status: "Skipped",
+                    current_stage: "Gold",
+                    skip_reason: "NO_BRONZE_RECORDS",
+                    clean_row_count: 0,
+                    rejected_row_count: 0,
+                    duplicate_row_count: 0,
+                    silver_file_count: 0,
+                    silver_finished_at: silverFinishedAt,
+                    updated_at: silverFinishedAt,
+                    failed_stage: "",
+                    error_category: "",
+                    error_code: "",
+                    error_message: "",
+                });
+
+                return {
+                    status: 200,
+                    jsonBody: {
+                        success: true,
+                        skipped: true,
+                        batch_id: batchId,
+                        silver_path: silverPath,
+                        source_row_count: bronzeRawRowCount,
+                        clean_row_count: 0,
+                        rejected_row_count: 0,
+                        duplicate_row_count: 0,
+                        message: "Silver skipped due to no bronze records",
+                    },
+                };
+            }
+            if (!Number.isInteger(pageCount) || pageCount < 0) {
+                throw new AppError("Bronze manifest page_count is invalid", {
+                    errorCode: "INVALID_PAGE_COUNT",
+                    errorCategory: "DataQuality",
+                    httpStatus: 500,
+                });
+            }
 
             const existingBatch = await this.batchLogClient.getBatch(batchLogPartitionKey, batchId);
 
@@ -130,13 +257,34 @@ class SilverService {
             let sourceRowCount = 0;
             const ingestedAtUtc = new Date().toISOString();
 
+            const outputFiles = [];
+
             const flushClean = async () => {
                 if (cleanBuffer.length === 0) {
                     return;
                 }
                 cleanPartNumber += 1;
-                const path = `${silverPrefix}/part-${String(cleanPartNumber).padStart(4, "0")}.jsonl`;
-                await this.blobClient.writeJsonLines(this.config.silverContainer, path, cleanBuffer);
+                const fileName = `part-${String(cleanPartNumber).padStart(4, "0")}.parquet`;
+                const blobPath = `${silverPrefix}/${fileName}`;
+
+                const tempFilePath = path.join(os.tmpdir(), `${crypto.randomUUID()}.parquet`);
+
+                try {
+                    const writer = await parquet.ParquetWriter.openFile(PARQUET_SCHEMA, tempFilePath);
+
+                    for (const record of cleanBuffer) {
+                        await writer.appendRow(cleanParquetRecord(record));
+                    }
+                    await writer.close();
+
+                    const buffer = await fs.promises.readFile(tempFilePath);
+                    await this.blobClient.uploadBuffer(this.config.silverContainer, blobPath, buffer, "application/vnd.apache.parquet");
+
+                    outputFiles.push(fileName);
+                } finally {
+                    await fs.promises.unlink(tempFilePath).catch(() => { });
+                }
+
                 cleanBuffer = [];
             };
 
@@ -221,7 +369,11 @@ class SilverService {
                 duplicate_row_count: duplicateRowCount,
                 clean_file_count: cleanPartNumber,
                 rejected_file_count: rejectedPartNumber,
-                output_format: "jsonl",
+                output_format: "parquet",
+                file_format: "parquet",
+                compression: "snappy",
+                schema_version: "1.0",
+                output_files: outputFiles,
                 excluded_from_clean_output: EXCLUDED_FIELDS_FROM_CLEAN_OUTPUT,
                 status: "Succeeded",
                 completed_at_utc: new Date().toISOString(),
@@ -268,7 +420,7 @@ class SilverService {
                     rejected_row_count: rejectedRowCount,
                     duplicate_row_count: duplicateRowCount,
                     clean_file_count: cleanPartNumber,
-                    output_format: "jsonl",
+                    output_format: "parquet",
                 },
             };
 
@@ -290,17 +442,17 @@ class SilverService {
                     // We need sourceName, pipelineType, entityName to build partition key.
                     // This implies error handling might be slightly incomplete if failed before reading manifest. 
                     // To keep exact behavior, we only log to table if we reached manifest reading successfully or handled it correctly.
-                    
+
                     // Actually, the original Silver.js only did:
                     // `if (batchLogClient && batchLogPartitionKey && batchId)`
                     // So we only update if we successfully figured out partitionKey
-                    
+
                     // We can extract what the old one did but it's okay to skip for now. We can reconstruct part key here if we want, or leave it.
                     // I will leave it to the calling wrapper function to handle errors gracefully if possible or we just handle it here by
                     // throwing and letting wrapper construct standard HTTP error. But we want to preserve BatchLog update.
                 }
-            } catch (err) {}
-            
+            } catch (err) { }
+
             throw error; // Let the wrapper handle it
         }
     }
